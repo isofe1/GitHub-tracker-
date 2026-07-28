@@ -1,0 +1,6 @@
+{
+  "name": "Release Hub",
+  "description": "An application to directly download files, APKs, and release assets from GitHub links to local storage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
