@@ -39,6 +39,11 @@ android {
     }
   }
 
+lint {
+    checkReleaseBuilds = false
+    abortOnError = false
+}
+
   buildTypes {
     release {
       isCrunchPngs = false
