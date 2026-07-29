@@ -35,49 +35,101 @@ object GitHubApiClient {
 
     suspend fun fetchLatestRelease(owner: String, repo: String): Result<GitHubReleaseData> = withContext(Dispatchers.IO) {
         try {
-            val url = "https://api.github.com/repos/$owner/$repo/releases/latest"
+            val url = "https://release-hub-backend.vercel.app/api/release?owner=$owner&repo=$repo"
             val request = Request.Builder()
                 .url(url)
-                .header("User-Agent", "GitHubDownloader-AndroidApp")
-                .header("Accept", "application/vnd.github.v3+json")
+                .header("User-Agent", "ReleaseHub-AndroidApp")
                 .build()
 
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    // Fallback to releases array
-                    val listUrl = "https://api.github.com/repos/$owner/$repo/releases"
-                    val listRequest = Request.Builder()
-                        .url(listUrl)
-                        .header("User-Agent", "GitHubDownloader-AndroidApp")
-                        .header("Accept", "application/vnd.github.v3+json")
-                        .build()
-                    client.newCall(listRequest).execute().use { listResponse ->
-                        if (!listResponse.isSuccessful) {
-                            return@withContext Result.failure(Exception("No releases found for $owner/$repo (${response.code})"))
-                        }
-                        val bodyStr = listResponse.body?.string() ?: ""
-                        val jsonArr = JSONArray(bodyStr)
-                        if (jsonArr.length() == 0) {
-                            return@withContext Result.failure(Exception("No releases available for project $owner/$repo"))
-                        }
-                        val latestObj = jsonArr.getJSONObject(0)
-                        return@withContext Result.success(parseReleaseJson(latestObj))
+                    val errorBody = response.body?.string() ?: ""
+                    val errorMsg = try {
+                        JSONObject(errorBody).optString("error", "Server error (${response.code})")
+                    } catch (_: Exception) {
+                        "Server error (${response.code})"
                     }
-                } else {
-                    val bodyStr = response.body?.string() ?: ""
-                    val jsonObj = JSONObject(bodyStr)
-                    return@withContext Result.success(parseReleaseJson(jsonObj))
+                    val webRes = fetchLatestReleaseFromWeb(owner, repo)
+                    if (webRes.isSuccess) return@withContext webRes
+
+                    return@withContext Result.failure(Exception(errorMsg))
                 }
+
+                val bodyStr = response.body?.string() ?: ""
+                val jsonObj = JSONObject(bodyStr)
+                return@withContext Result.success(parseReleaseJson(jsonObj))
             }
         } catch (e: Exception) {
+            val webRes = fetchLatestReleaseFromWeb(owner, repo)
+            if (webRes.isSuccess) {
+                return@withContext webRes
+            }
             Result.failure(e)
         }
     }
 
+    private fun fetchLatestReleaseFromWeb(owner: String, repo: String): Result<GitHubReleaseData> {
+        return try {
+            val webUrl = "https://github.com/$owner/$repo/releases/latest"
+            val request = Request.Builder()
+                .url(webUrl)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return Result.failure(Exception("GitHub API rate limit (403) reached and project web page returned ${response.code}"))
+                }
+                val finalUrl = response.request.url.toString()
+                val html = response.body?.string() ?: ""
+
+                var tagName = finalUrl.substringAfter("/releases/tag/", "").substringBefore("?").trim()
+                if (tagName.isBlank() || tagName == finalUrl) {
+                    val tagRegex = Regex("""/releases/tag/([^"'\s?]+)""")
+                    val match = tagRegex.find(html)
+                    tagName = match?.groupValues?.get(1) ?: "latest"
+                }
+
+                val assetsList = mutableListOf<ReleaseAsset>()
+                val assetRegex = Regex("""href="(/$owner/$repo/releases/download/[^"]+)"""", RegexOption.IGNORE_CASE)
+                val matches = assetRegex.findAll(html)
+                val addedUrls = mutableSetOf<String>()
+
+                for (m in matches) {
+                    val relativePath = m.groupValues[1]
+                    val fullUrl = "https://github.com$relativePath"
+                    if (addedUrls.add(fullUrl)) {
+                        val fileName = relativePath.substringAfterLast("/")
+                        if (fileName.isNotBlank()) {
+                            assetsList.add(ReleaseAsset(name = fileName, downloadUrl = fullUrl, size = 0L, downloadCount = 0))
+                        }
+                    }
+                }
+
+                if (assetsList.isEmpty()) {
+                    val sourceZip = "https://github.com/$owner/$repo/archive/refs/tags/$tagName.zip"
+                    assetsList.add(ReleaseAsset(name = "Source code (zip)", downloadUrl = sourceZip, size = 0L, downloadCount = 0))
+                }
+
+                Result.success(
+                    GitHubReleaseData(
+                        tagName = tagName,
+                        releaseName = "$repo $tagName",
+                        htmlUrl = finalUrl,
+                        assets = assetsList
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception("GitHub Rate Limit (403): ${e.localizedMessage}"))
+        }
+    }
+
     private fun parseReleaseJson(jsonObj: JSONObject): GitHubReleaseData {
-        val tagName = jsonObj.optString("tag_name", "latest")
-        val releaseName = jsonObj.optString("name", tagName)
-        val htmlUrl = jsonObj.optString("html_url", "")
+        val tagName = jsonObj.optString("tag_name", jsonObj.optString("tagName", "latest"))
+        val releaseName = jsonObj.optString("name", jsonObj.optString("releaseName", tagName))
+        val htmlUrl = jsonObj.optString("html_url", jsonObj.optString("htmlUrl", ""))
 
         val assetsList = mutableListOf<ReleaseAsset>()
         val assetsArr = jsonObj.optJSONArray("assets")
@@ -85,9 +137,18 @@ object GitHubApiClient {
             for (i in 0 until assetsArr.length()) {
                 val assetObj = assetsArr.getJSONObject(i)
                 val name = assetObj.optString("name", "asset_$i")
-                val downloadUrl = assetObj.optString("browser_download_url", "")
+                val downloadUrl = when {
+                    assetObj.has("download_url") -> assetObj.optString("download_url", "")
+                    assetObj.has("browser_download_url") -> assetObj.optString("browser_download_url", "")
+                    assetObj.has("downloadUrl") -> assetObj.optString("downloadUrl", "")
+                    else -> ""
+                }
                 val size = assetObj.optLong("size", 0L)
-                val count = assetObj.optInt("download_count", 0)
+                val count = when {
+                    assetObj.has("download_count") -> assetObj.optInt("download_count", 0)
+                    assetObj.has("downloadCount") -> assetObj.optInt("downloadCount", 0)
+                    else -> 0
+                }
                 if (downloadUrl.isNotBlank()) {
                     assetsList.add(ReleaseAsset(name, downloadUrl, size, count))
                 }
